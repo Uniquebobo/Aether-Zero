@@ -1,3 +1,5 @@
+-- Split repositories: dispatcher URL is independent of the game-files base URL.
+-- Execute official game wrappers unchanged unless NamedLuaProtChunks=true is explicitly requested.
 local env = type(getgenv) == "function" and getgenv() or _G
 assert(type(env) == "table", "[Aether] Executor environment is not a table")
 if env.A0_AETHER_LOADER_BUSY then
@@ -19,9 +21,18 @@ end
 
 local function run()
     assert(type(loadstring) == "function", "Executor loadstring is unavailable")
-    local base = env.A0_AETHER_BASE_URL or "https://raw.githubusercontent.com/MeneSkidButBetterThanYou/AetherZero/refs/heads/main/"
-    assert(type(base) == "string" and base:match("^https://"), "Base URL must use HTTPS")
+    -- The game files and the dispatcher intentionally live in different repos.
+    local defaultGamesBase = "https://raw.githubusercontent.com/MeneSkidButBetterThanYou/AetherZero/refs/heads/main/"
+    local defaultLoaderURL = "https://raw.githubusercontent.com/Uniquebobo/Aether-Zero/refs/heads/main/Loader.lua"
+    local legacyBase = env.A0_AETHER_BASE_URL
+    if legacyBase == defaultLoaderURL:match("^(.*[/])") then legacyBase = nil end
+    local base = env.A0_AETHER_GAMES_BASE_URL or legacyBase or defaultGamesBase
+    local loaderScriptURL = env.A0_AETHER_LOADER_URL or defaultLoaderURL
+    assert(type(base) == "string" and base:match("^https://"), "Games base URL must use HTTPS")
+    assert(type(loaderScriptURL) == "string" and loaderScriptURL:match("^https://"), "Loader URL must use HTTPS")
     if base:sub(-1) ~= "/" then base ..= "/" end
+    diagnostic.GamesBaseURL = base
+    diagnostic.LoaderURL = loaderScriptURL
     local opts = type(env.A0_LOADER_OPTIONS) == "table" and env.A0_LOADER_OPTIONS or {}
     local timeout = tonumber(opts.ReadinessTimeout) or 120
     if timeout ~= timeout or math.abs(timeout) == math.huge then timeout = 120 end
@@ -89,8 +100,9 @@ local function run()
         local queue = firstFunction(queue_on_teleport, queueonteleport, synEnv.queue_on_teleport,
             fluxEnv.queue_on_teleport, deltaEnv.queue_on_teleport, deltaEnv.queueonteleport)
         if not queue then return false, "executor queue unavailable" end
-        local loaderURL = base .. "Loader.lua"
-        if env.A0_AETHER_QUEUED_LOADER_URL == loaderURL then return true, "already queued" end
+        local loaderURL = loaderScriptURL
+        local signature = loaderURL .. "|" .. base .. "|" .. tostring(timeout) .. "|" .. tostring(opts.NamedLuaProtChunks == true)
+        if env.A0_AETHER_QUEUED_LOADER_SIGNATURE == signature then return true, "already queued" end
         -- Don't queue a known-broken URL. This checks syntax, but never executes it here.
         local checked, reason = pcall(function()
             compile(download(loaderURL, "teleport Loader.lua"), "@Aether/Loader.lua")
@@ -98,9 +110,11 @@ local function run()
         if not checked then return false, "not queued: " .. tostring(reason) end
         local code = "local e=type(getgenv)=='function' and getgenv() or _G; "
             .. "e.A0_AETHER_BASE_URL=" .. string.format("%q", base) .. "; "
+            .. "e.A0_AETHER_GAMES_BASE_URL=" .. string.format("%q", base) .. "; "
+            .. "e.A0_AETHER_LOADER_URL=" .. string.format("%q", loaderScriptURL) .. "; "
             .. "local o=type(e.A0_LOADER_OPTIONS)=='table' and e.A0_LOADER_OPTIONS or {}; "
             .. "o.ReadinessTimeout=" .. tostring(timeout) .. "; "
-            .. "o.NamedLuaProtChunks=" .. tostring(opts.NamedLuaProtChunks ~= false) .. "; "
+            .. "o.NamedLuaProtChunks=" .. tostring(opts.NamedLuaProtChunks == true) .. "; "
             .. "e.A0_LOADER_OPTIONS=o; "
             .. "local s=game:HttpGet(" .. string.format("%q", loaderURL) .. "); "
             .. "local f,err=loadstring(s,'@Aether/Loader.lua'); "
@@ -108,6 +122,7 @@ local function run()
         local ok, result = pcall(queue, code)
         if not ok or result == false then return false, "queue failed: " .. tostring(result) end
         env.A0_AETHER_QUEUED_LOADER_URL = loaderURL
+        env.A0_AETHER_QUEUED_LOADER_SIGNATURE = signature
         return true, "queued for teleport"
     end
 
@@ -154,7 +169,7 @@ local function run()
     diagnostic.WrapperBytes = #source
     diagnostic.Chunk = "@Aether/" .. file
     local endpoint
-    if opts.NamedLuaProtChunks ~= false then
+    if opts.NamedLuaProtChunks == true then
         endpoint = source:match('^%s*loadstring%s*%(%s*game%s*:%s*HttpGet%s*%(%s*"(https://luaprot%.net/api/v3/loaders/get/%d+)"%s*%)%s*%)%s*%(%s*%)%s*;?%s*$')
             or source:match("^%s*loadstring%s*%(%s*game%s*:%s*HttpGet%s*%(%s*'(https://luaprot%.net/api/v3/loaders/get/%d+)'%s*%)%s*%)%s*%(%s*%)%s*;?%s*$")
     end
