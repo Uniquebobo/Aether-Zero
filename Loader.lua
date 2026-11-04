@@ -1,36 +1,62 @@
 local env = type(getgenv) == "function" and getgenv() or _G
 assert(type(env) == "table", "[Aether] Executor environment unavailable")
 
-if env.A0_AETHER_LOADER_BUSY then
-    print("[Aether] Startup is already in progress")
+local active = env.A0_AETHER_LOADER_BUSY
+if type(active) == "table" and type(active.Expires) == "number" and os.clock() < active.Expires then
+    print("[Aether] Startup is already in progress (" .. tostring(active.Stage) .. ")")
     return
 end
 
-env.A0_AETHER_LOADER_BUSY = true
+local options = type(env.A0_LOADER_OPTIONS) == "table" and env.A0_LOADER_OPTIONS or {}
+
+local function limit(value, fallback, maximum)
+    local number = tonumber(value) or fallback
+    if number ~= number or math.abs(number) == math.huge then number = fallback end
+    return math.clamp(number, 0, maximum)
+end
+
+local readinessLimit = limit(options.ReadinessTimeout, 120, 600)
+local detectionLimit = limit(options.DetectionTimeout, 8, 30)
 
 local state = {
     Stage = "setup",
     Status = "starting",
     Started = os.clock(),
 }
+state.Expires = state.Started + 10
+env.A0_AETHER_LOADER_BUSY = state
 env.A0_AETHER_LOADER_DIAGNOSTIC = state
 
 local function fail(message)
     error(message, 0)
 end
 
-local function run()
-    assert(type(loadstring) == "function", "Executor loadstring is unavailable")
+local function stage(name, seconds)
+    state.Stage = name
+    state.Expires = os.clock() + seconds
+end
 
-    local options = type(env.A0_LOADER_OPTIONS) == "table" and env.A0_LOADER_OPTIONS or {}
+local function run()
+    if type(loadstring) ~= "function" then fail("Executor loadstring is unavailable") end
+
+    local Players = game:GetService("Players")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
     local defaultBase = "https://raw.githubusercontent.com/MeneSkidButBetterThanYou/AetherZero/refs/heads/main/"
     local dispatcherBase = "https://raw.githubusercontent.com/Uniquebobo/Aether-Zero/refs/heads/main/"
-    local legacyBase = env.A0_AETHER_BASE_URL
-    if legacyBase == dispatcherBase then legacyBase = nil end
+    local luaProtWrapper = [[^%s*loadstring%s*%(%s*game%s*:%s*HttpGet%s*%(%s*(["'])(https://luaprot%.net/api/v3/loaders/get/%d+)%1%s*%)%s*%)%s*%(%s*%)%s*;?%s*$]]
 
+    local function slash(url)
+        return url:sub(-1) == "/" and url or url .. "/"
+    end
+
+    local legacyBase = env.A0_AETHER_BASE_URL
+    if type(legacyBase) == "string" and slash(legacyBase) == dispatcherBase then legacyBase = nil end
     local base = env.A0_AETHER_GAMES_BASE_URL or legacyBase or defaultBase
-    assert(type(base) == "string" and base:match("^https://"), "Games base URL must use HTTPS")
-    if base:sub(-1) ~= "/" then base ..= "/" end
+    if type(base) ~= "string" or not base:match("^https://[%w%-%.]+") then
+        fail("Games base URL must be an HTTPS URL")
+    end
+    base = slash(base)
     state.GamesBaseURL = base
 
     local games = {
@@ -51,26 +77,20 @@ local function run()
         BB = { universe = 4777817887, file = "BladeBall.lua", places = { 13772394625 } },
     }
 
-    local places, universes = {}, {}
+    local placeGame, universeGame = {}, {}
     for name, info in pairs(games) do
-        universes[info.universe] = name
+        universeGame[info.universe] = name
         for _, id in ipairs(info.places) do
-            places[id] = name
+            placeGame[id] = name
         end
     end
 
     if type(options.PlaceIds) == "table" then
         for id, name in pairs(options.PlaceIds) do
             if type(id) == "number" and id > 0 and games[name] then
-                places[id] = name
+                placeGame[id] = name
             end
         end
-    end
-
-    local function timeout(value, fallback, limit)
-        local number = tonumber(value) or fallback
-        if number ~= number or math.abs(number) == math.huge then number = fallback end
-        return math.clamp(number, 0, limit)
     end
 
     local function child(root, ...)
@@ -103,150 +123,166 @@ local function run()
         return false
     end
 
-    local function candidates(player)
-        local storage = game:GetService("ReplicatedStorage")
+    local function swordController()
+        local controllers = child(ReplicatedStorage, "Controllers")
+        if not controllers then return false end
+        for _, controller in ipairs(controllers:GetChildren()) do
+            if isA(controller, "ModuleScript") and controller.Name:match("^SwordsController[%s%c]*$")
+                and isA(child(controller, "PRY"), "ModuleScript") then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function signatures(player)
         local found = {}
-        local function add(name, condition)
-            if condition then found[#found + 1] = name end
+        local function add(name, matched)
+            if matched then found[#found + 1] = name end
         end
 
-        local blairRemotes = child(storage, "Remotes")
+        local remotes = child(ReplicatedStorage, "Remotes")
+
         local ghostSignals = 0
         for _, name in ipairs({ "PlayerDiscoveredGhostOrbs", "PlayerDiscoveredSLSAnomaly", "FreezingTempatureObjective" }) do
-            if remote(child(blairRemotes, name)) then ghostSignals += 1 end
+            if remote(child(remotes, name)) then ghostSignals += 1 end
         end
         add("Blair", ghostSignals >= 2)
 
-        add("FTF", child(storage, "GameStatus") ~= nil
-            and child(storage, "IsGameActive") ~= nil
-            and remote(child(storage, "RemoteEvent"))
+        add("FTF", child(ReplicatedStorage, "GameStatus") ~= nil
+            and child(ReplicatedStorage, "IsGameActive") ~= nil
+            and remote(child(ReplicatedStorage, "RemoteEvent"))
             and child(player, "TempPlayerStatsModule") ~= nil)
 
-        add("VBL", isA(child(storage, "Content", "Style"), "ModuleScript")
-            and isA(child(storage, "Content", "Special"), "ModuleScript"))
+        add("VBL", isA(child(ReplicatedStorage, "Content", "Style"), "ModuleScript")
+            and isA(child(ReplicatedStorage, "Content", "Special"), "ModuleScript"))
 
-        local scourge = child(storage, "Remotes", "KillerPerks", "kingscourge")
-        local vdShop = child(storage, "ShopKillers")
+        local scourge = child(remotes, "KillerPerks", "kingscourge")
         add("VD", (currency(player, "Screws") and currency(player, "Gears"))
-            or (vdShop ~= nil and remote(child(scourge, "KingScourgeStart"))
+            or (child(ReplicatedStorage, "ShopKillers") ~= nil
+                and remote(child(scourge, "KingScourgeStart"))
                 and remote(child(scourge, "KingScourgeEnd"))))
 
-        local events = child(storage, "Events")
-        add("GPO", remote(child(storage, "Crab_Strangler"))
+        local events = child(ReplicatedStorage, "Events")
+        add("GPO", remote(child(ReplicatedStorage, "Crab_Strangler"))
             and (remote(child(events, "Skill")) or remote(child(events, "takestam"))))
 
-        local controllers = child(storage, "Controllers")
-        local swordController = false
-        if controllers then
-            for _, controller in ipairs(controllers:GetChildren()) do
-                if isA(controller, "ModuleScript") and controller.Name:match("^SwordsController[%s%c]*$")
-                    and isA(child(controller, "PRY"), "ModuleScript") then
-                    swordController = true
-                    break
-                end
-            end
-        end
-        local ballRemotes = child(storage, "Remotes")
-        local ballSignals = remote(child(ballRemotes, "ParrySuccess"))
-            and remote(child(ballRemotes, "NoobParryHappened"))
-        add("BB", ballSignals or (isA(child(storage, "Shared", "UseBall2"), "ModuleScript")
-            and swordController))
+        add("BB", (remote(child(remotes, "ParrySuccess")) and remote(child(remotes, "NoobParryHappened")))
+            or (isA(child(ReplicatedStorage, "Shared", "UseBall2"), "ModuleScript") and swordController()))
 
         return found
     end
 
-    local function selectGame(player, placeId, universeId)
-        local byPlace = places[placeId]
-        local byUniverse = universes[universeId]
+    local function selectGame(player)
+        local forced = options.Game
+        if forced ~= nil then
+            if not games[forced] then fail("Unknown game override: " .. tostring(forced)) end
+            return forced, "override"
+        end
+
+        local byPlace, byUniverse = placeGame[game.PlaceId], universeGame[game.GameId]
         if byPlace and byUniverse and byPlace ~= byUniverse then
-            fail("Place and universe identify different games: " .. tostring(placeId) .. " / " .. tostring(universeId))
+            fail("Place and universe identify different games: " .. tostring(game.PlaceId) .. " / " .. tostring(game.GameId))
         end
+        if byUniverse then return byUniverse, "universe ID" end
+        if byPlace then return byPlace, "place ID" end
 
-        local selected = byUniverse or byPlace
-        if selected then
-            state.SelectionReason = byUniverse and "universe ID" or "place ID"
-            return selected
-        end
+        stage("game detection", detectionLimit + 5)
+        local deadline = os.clock() + detectionLimit
+        local candidate, since
+        while true do
+            local found = signatures(player)
+            if #found > 1 then fail("Ambiguous game signatures: " .. table.concat(found, ", ")) end
 
-        state.Stage = "game detection"
-        local deadline = os.clock() + timeout(options.DetectionTimeout, 8, 30)
-        local firstMatch, matchedAt
-        repeat
-            local found = candidates(player)
-            if #found > 1 then
-                fail("Ambiguous game signatures: " .. table.concat(found, ", "))
-            end
-            if #found == 1 then
-                if firstMatch and firstMatch ~= found[1] then
-                    fail("Conflicting game signatures: " .. firstMatch .. ", " .. found[1])
+            local now = os.clock()
+            if found[1] then
+                if candidate and candidate ~= found[1] then
+                    fail("Conflicting game signatures: " .. candidate .. ", " .. found[1])
                 end
-                if not firstMatch then firstMatch, matchedAt = found[1], os.clock() end
-                if os.clock() - matchedAt >= 1.5 or os.clock() >= deadline then
-                    state.SelectionReason = "replicated signature"
-                    return firstMatch
+                if not candidate then candidate, since = found[1], now end
+                if now - since >= 1.5 or now >= deadline then
+                    return candidate, "replicated signature"
                 end
-            elseif firstMatch then
-                firstMatch, matchedAt = nil, nil
+            else
+                candidate, since = nil, nil
             end
-            if os.clock() >= deadline then break end
+
+            if now >= deadline then break end
             task.wait(0.1)
-        until false
+        end
 
-        fail("Unsupported or unrecognized game. PlaceId: " .. tostring(placeId) .. ", GameId: " .. tostring(universeId))
+        fail("Unsupported or unrecognized game. PlaceId: " .. tostring(game.PlaceId) .. ", GameId: " .. tostring(game.GameId))
     end
 
     local function download(url, label)
-        local ok, source = pcall(function() return game:HttpGet(url) end)
-        if not ok then fail("Download failed for " .. label .. ": " .. tostring(source) .. "\nURL: " .. url) end
-        if type(source) ~= "string" or not source:find("%S") then fail("Empty response for " .. label .. "\nURL: " .. url) end
-        local head = source:sub(1, 256):lower()
-        if head:match("^%s*<!doctype%s+html") or head:match("^%s*<html") or source:match("^%s*404:%s*Not Found%s*$") then
-            fail("Server returned an error page for " .. label .. "\nURL: " .. url)
+        local problem = "no response"
+        for attempt = 1, 3 do
+            local ok, body = pcall(function() return game:HttpGet(url) end)
+            if ok and type(body) == "string" then
+                body = body:gsub("^\239\187\191", "")
+                local code, reason
+                if #body < 256 then code, reason = body:match("^%s*([1-5]%d%d):%s*(.-)%s*$") end
+                local head = body:sub(1, 256):lower()
+
+                if code == "404" then
+                    fail(label .. " was not found (HTTP 404)\nURL: " .. url)
+                elseif code then
+                    problem = "HTTP " .. code .. " " .. reason
+                elseif head:match("^%s*<!doctype%s+html") or head:match("^%s*<html") then
+                    problem = "server returned an HTML page"
+                elseif not body:find("%S") then
+                    problem = "empty response"
+                else
+                    return body
+                end
+            elseif ok then
+                problem = "invalid response type " .. type(body)
+            else
+                problem = tostring(body)
+            end
+
+            if attempt < 3 then task.wait(attempt) end
         end
-        return source
+        fail("Download failed for " .. label .. " after 3 attempts: " .. problem .. "\nURL: " .. url)
     end
 
-    state.Stage = "client readiness"
-    local deadline = os.clock() + timeout(options.ReadinessTimeout, 120, 600)
-    local player
-    repeat
-        local waiting = "Roblox"
-        if game:IsLoaded() then
-            player = game:GetService("Players").LocalPlayer
-            waiting = "LocalPlayer"
-            if player then
-                local gui = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
-                waiting = "PlayerGui"
-                if gui then
-                    local camera = workspace.CurrentCamera
-                    local viewport = camera and camera.ViewportSize
-                    waiting = "camera"
-                    if viewport and viewport.X > 0 and viewport.Y > 0 and type(game.PlaceId) == "number" and game.PlaceId > 0 then
-                        break
-                    end
-                end
-            end
-        end
+    local function readiness()
+        if not game:IsLoaded() then return nil, "Roblox" end
+        local player = Players.LocalPlayer
+        if not player then return nil, "LocalPlayer" end
+        if not player:FindFirstChildOfClass("PlayerGui") then return nil, "PlayerGui" end
+        local camera = workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize
+        if not viewport or viewport.X <= 0 or viewport.Y <= 0 then return nil, "camera" end
+        if game.PlaceId <= 0 then return nil, "place ID" end
+        return player
+    end
+
+    stage("client readiness", readinessLimit + 5)
+    local deadline = os.clock() + readinessLimit
+    local player, waiting = readiness()
+    while not player do
         state.Stage = "waiting for " .. waiting
         if os.clock() >= deadline then fail("Startup timed out waiting for " .. waiting) end
         task.wait(0.1)
-    until false
+        player, waiting = readiness()
+    end
 
     state.PlaceId, state.UniverseId = game.PlaceId, game.GameId
-    state.Stage = "game selection"
-    local selected = selectGame(player, game.PlaceId, game.GameId)
+    stage("game selection", 5)
+    local selected, reason = selectGame(player)
     local file = games[selected].file
-    state.Game, state.File, state.URL = selected, file, base .. file
-    state.Stage = "download " .. file
-    local source = download(state.URL, file)
-    state.WrapperBytes = #source
+    state.Game, state.File, state.URL, state.SelectionReason = selected, file, base .. file, reason
     state.Chunk = "@Aether/" .. file
 
+    stage("download " .. file, 120)
+    local source = download(state.URL, file)
+    state.WrapperBytes = #source
+
     if options.NamedLuaProtChunks == true then
-        local endpoint = source:match('^%s*loadstring%s*%(%s*game%s*:%s*HttpGet%s*%(%s*"(https://luaprot%.net/api/v3/loaders/get/%d+)"%s*%)%s*%)%s*%(%s*%)%s*;?%s*$')
-            or source:match("^%s*loadstring%s*%(%s*game%s*:%s*HttpGet%s*%(%s*'(https://luaprot%.net/api/v3/loaders/get/%d+)'%s*%)%s*%)%s*%(%s*%)%s*;?%s*$")
+        local _, endpoint = source:match(luaProtWrapper)
         if endpoint then
-            state.Stage = "download protected payload"
+            stage("download protected payload", 120)
             state.PayloadURL = endpoint
             source = download(endpoint, file .. " protected payload")
             state.Chunk = "@Aether/" .. file .. "/LuaProt"
@@ -254,14 +290,14 @@ local function run()
     end
 
     state.SourceBytes = #source
-    state.Stage = "compile " .. file
-    local ok, entry, reason = pcall(loadstring, source, state.Chunk)
+    stage("compile " .. file, 30)
+    local ok, entry, err = pcall(loadstring, source, state.Chunk)
     if not ok then fail("Compiler failed for " .. file .. ": " .. tostring(entry)) end
-    if type(entry) ~= "function" then fail("Compile failed for " .. file .. ": " .. tostring(reason)) end
+    if type(entry) ~= "function" then fail("Compile failed for " .. file .. ": " .. tostring(err)) end
 
     env.A0_AETHER_LAST_ENTRY = file
-    state.Stage = "execute " .. file
-    print("[Aether] Starting " .. file .. " (" .. state.SelectionReason .. ")")
+    stage("execute " .. file, 30)
+    print("[Aether] Starting " .. file .. " (" .. reason .. ")")
     return entry()
 end
 
@@ -274,7 +310,7 @@ local results = table.pack(xpcall(run, function(err)
     return message
 end))
 
-env.A0_AETHER_LOADER_BUSY = nil
+if env.A0_AETHER_LOADER_BUSY == state then env.A0_AETHER_LOADER_BUSY = nil end
 state.Finished = os.clock()
 
 if not results[1] then
