@@ -37,6 +37,17 @@ local function stage(name, seconds)
 end
 
 local function run()
+    if not game:IsLoaded() then
+        stage("waiting for game to load", readinessLimit)
+        local startWait = os.clock()
+        repeat
+            task.wait(0.1)
+            if os.clock() - startWait >= readinessLimit then
+                fail("Startup timed out waiting for game:IsLoaded()")
+            end
+        until game:IsLoaded()
+    end
+
     if type(loadstring) ~= "function" then fail("Executor loadstring is unavailable") end
 
     local Players = game:GetService("Players")
